@@ -1,15 +1,17 @@
 import cv2
-import mediapipe as mp
 import torch
 import torch.nn as nn
 import numpy as np
 from torchvision import transforms
 
+from FaceMeshModule import FaceMeshDetector  # 오픈소스 모듈 import
+
+
 # --------------------------
 # 1. PyTorch 모델 정의 (간단한 MLP)
 # --------------------------
 class StressPredictor(nn.Module):
-    def __init__(self, input_dim=478*2, hidden_dim=256):
+    def __init__(self, input_dim=468 * 2, hidden_dim=256):   
         super().__init__()
         self.fc = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
@@ -22,18 +24,17 @@ class StressPredictor(nn.Module):
     def forward(self, x):
         return self.fc(x)
 
-# --------------------------
-# 2. Mediapipe 초기화
-# --------------------------
-mp_face = mp.solutions.face_mesh
-face_mesh = mp_face.FaceMesh(static_image_mode=False, max_num_faces=1, refine_landmarks=True)
-mp_drawing = mp.solutions.drawing_utils
 
 # --------------------------
-# 3. 모델 로드 (초기엔 랜덤 가중치)
+# 2. 모델 로드 (초기엔 랜덤 가중치)
 # --------------------------
 model = StressPredictor()
 model.eval()
+
+# --------------------------
+# 3. FaceMeshDetector 초기화
+# --------------------------
+detector = FaceMeshDetector()
 
 # --------------------------
 # 4. 웹캠 스트리밍 시작
@@ -49,41 +50,36 @@ while cap.isOpened():
     if not ret:
         break
 
-    # 좌우반전 (자연스럽게)
+    # 좌우 반전 (자연스럽게 보기 위해)
     frame = cv2.flip(frame, 1)
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-    result = face_mesh.process(rgb)
+    # 얼굴 메쉬 탐지 및 시각화
+    frame = detector.findFaceMesh(frame, draw=True)
+    lmList = detector.findPosition(frame, draw=False)  # draw=True 하면 landmark 점도 표시됨
 
-    if result.multi_face_landmarks:
-        for face_landmarks in result.multi_face_landmarks:
-            # 얼굴 랜드마크 468개 (x, y)
-            coords = []
-            h, w, _ = frame.shape
-            for lm in face_landmarks.landmark:
-                coords.append(lm.x)
-                coords.append(lm.y)
+    if len(lmList) != 0:
+        # (id, x, y) 중 x, y만 추출
+        coords = np.array(lmList)[:, 1:3].flatten()
 
-            coords = torch.tensor(coords, dtype=torch.float32).unsqueeze(0)
+        # torch tensor로 변환
+        coords = torch.tensor(coords, dtype=torch.float32).unsqueeze(0)
 
-            # 예측 (스트레스 지수 0~1)
-            with torch.no_grad():
-                stress_score = model(coords).item()
+        # 모델 예측 (스트레스 지수: 0~1)
+        with torch.no_grad():
+            stress_score = model(coords).item()
 
-            # 시각화
-            mp_drawing.draw_landmarks(
-                frame,
-                face_landmarks,
-                mp_face.FACEMESH_CONTOURS,
-                mp_drawing.DrawingSpec(color=(0,255,0), thickness=1, circle_radius=1)
-            )
+        # 화면에 표시
+        cv2.putText(frame, f"Stress Score: {stress_score:.2f}",
+                    (20, 40), cv2.FONT_HERSHEY_SIMPLEX,
+                    1, (0, 0, 255), 2)
 
-            cv2.putText(frame, f"Stress Score: {stress_score:.2f}", (20, 40),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-
+    # 결과 화면 출력
     cv2.imshow("Stress Estimation (Press Q to Exit)", frame)
+
+    # 종료 키(Q)
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break
 
+# 종료 처리
 cap.release()
 cv2.destroyAllWindows()
