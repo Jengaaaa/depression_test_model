@@ -1,0 +1,44 @@
+# Ignore unnecessary files
+# ===== Python & Cache =====
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# ===== Jupyter & VSCode =====
+.ipynb_checkpoints/
+.vscode/
+.DS_Store
+
+# ===== Model Files =====
+*.pt
+*.pth
+*.h5
+*.pkl
+*.joblib
+
+# ===== Data Files =====
+*.csv
+*.xlsx
+*.zip
+*.rar
+*.tar
+*.gz
+*.wav
+*.m4a
+*.mp3
+*.mp4
+*.avi
+*.mov
+
+# ===== Logs & Temp =====
+*.log
+*.tmp
+*.bak
+*.swp
+
+# ===== Environment =====
+.env
+.venv/
+env/
+venv/
