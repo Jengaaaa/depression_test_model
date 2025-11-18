@@ -5,133 +5,230 @@ import numpy as np
 from scipy import signal
 from tqdm import tqdm
 
-# ===============================
-# HRV 데이터 전처리 스크립트 (최종 수정판)
-# ===============================
+# ============================================
+# HRV Feature Extraction (SWELL, elapsedtime 기반 + 다중 시트)
+# ============================================
 
-# 현재 파일 기준으로 절대경로 자동 설정
-BASE_DATA_DIR = Path(__file__).resolve().parents[1] / "document_model" / "data" / "hrv_dataset" / "data"
-RAW_DIR = BASE_DATA_DIR / "raw" / "rri"
-LABEL_PATH = BASE_DATA_DIR / "raw" / "labels" / "hrv stress labels.xlsx"
-OUT_PATH = BASE_DATA_DIR / "processed_hrv.csv"
+# document_model/data/hrv_dataset/data 기준 경로
+BASE_DIR = Path(__file__).resolve().parents[1] / "document_model" / "data" / "hrv_dataset" / "data"
+RRI_DIR = BASE_DIR / "raw" / "rri"
+LABEL_FILE = BASE_DIR / "raw" / "labels" / "hrv stress labels.xlsx"
+OUT_PATH = BASE_DIR / "processed_hrv.csv"
 
-# -------------------------------
-# 1. RRI 텍스트 파일 로드
-# -------------------------------
-def load_rri_files(raw_dir):
-    """RRI 텍스트 파일 로드 (각 피험자별로 길이 다름)
-    - 파일 구조: 각 줄에 1개 이상의 공백 구분 숫자
-    """
-    raw_dir = Path(raw_dir)
-    data = {}
 
-    if not raw_dir.exists():
-        raise FileNotFoundError(f"RAW_DIR not found: {raw_dir}")
+# --------------------------------------------------------
+# 1) RRI 파일 로드
+#    - 각 파일: timestamp / rri(ms) 형태 2컬럼
+#    - RRI를 300~2000ms 사이로 필터링 + 보간
+#    - 분석 편의를 위해 time_s = 0,1,2,... 로 재정의
+# --------------------------------------------------------
+def load_rri_files(rri_dir: Path):
+    data_dict = {}
 
-    for fp in raw_dir.iterdir():
-        if fp.suffix.lower() == ".txt":
-            pid = fp.stem
-            text = fp.read_text(encoding="utf-8", errors="ignore")
-            lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-            if not lines:
+    if not rri_dir.exists():
+        raise FileNotFoundError(f"❌ RRI_DIR not found: {rri_dir}")
+
+    for fp in sorted(rri_dir.glob("*.txt")):
+        pid = fp.stem.lower()  # p1, p2, ...
+
+        try:
+            arr = np.loadtxt(fp)
+            # 형상이 (N,2)가 아니면 스킵
+            if arr.ndim != 2 or arr.shape[1] != 2:
+                print(f"⚠️ Skipping {pid}: invalid shape {arr.shape}")
                 continue
 
-            rr_values = []
-            for ln in lines:
-                # 한 줄에 여러 숫자가 있는 경우 split으로 나누기
-                for token in ln.replace(",", ".").split():
-                    try:
-                        rr_values.append(float(token))
-                    except ValueError:
-                        continue
+            df = pd.DataFrame(arr, columns=["raw_time", "rri_ms"])
 
-            if len(rr_values) == 0:
-                print(f"⚠️ Skipping {pid}: no valid numeric RR values found.")
-                continue
+            # RRI 정상 범위만 사용 (artifact 제거)
+            df = df[(df["rri_ms"] >= 300) & (df["rri_ms"] <= 2000)]
 
-            rr_intervals = np.array(rr_values, dtype=float)
-            data[pid] = rr_intervals
+            # 결측이 있으면 보간
+            df["rri_ms"] = df["rri_ms"].interpolate()
 
-    if len(data) == 0:
-        raise RuntimeError(f"No valid RRI data found under {raw_dir}")
-    return data
+            # elapsedtime 과 맞추기 위해 0,1,2,... 로 재정의
+            df["time_s"] = np.arange(len(df))
 
-# -------------------------------
-# 2. HRV 지표 계산 함수
-# -------------------------------
-def compute_hrv_features(rr_intervals):
-    """RRI 배열로부터 HRV 주요 지표 계산"""
-    diff = np.diff(rr_intervals)
-    features = {
-        "MeanNN": np.mean(rr_intervals),
-        "SDNN": np.std(rr_intervals),
-        "RMSSD": np.sqrt(np.mean(diff**2)),
-        "pNN50": np.sum(np.abs(diff) > 50) / len(diff) * 100 if len(diff) > 0 else np.nan,
-    }
-    # 주파수 기반 HRV (Welch)
+            data_dict[pid] = df
+
+        except Exception as e:
+            print(f"⚠️ Failed to load {pid}: {e}")
+            continue
+
+    print(f"✅ Loaded {len(data_dict)} participant RRI files.")
+    return data_dict
+
+
+# --------------------------------------------------------
+# 2) 라벨 엑셀 모든 시트 로드
+#    - PP1 ~ PP25 등 여러 시트를 전부 합침
+#    - subject → id (pp1 → p1)
+#    - elapsedtime → elapsed (초 단위 숫자)
+# --------------------------------------------------------
+def load_all_labels(xlsx_path: Path) -> pd.DataFrame:
+    if not xlsx_path.exists():
+        raise FileNotFoundError(f"❌ Label file not found: {xlsx_path}")
+
+    xls = pd.ExcelFile(xlsx_path)
+    all_rows = []
+
+    for sheet in xls.sheet_names:
+        df = xls.parse(sheet)
+
+        # 컬럼명 정규화
+        df.columns = [c.strip().lower() for c in df.columns]
+
+        # 주요 컬럼 rename (엑셀 구조에 따라 다를 수 있음, 필요 시 조정)
+        df = df.rename(
+            columns={
+                "subject": "id",
+                "elapsedtime": "elapsed",
+                "condition": "condition",
+                "label": "label",
+            }
+        )
+
+        # id를 p1, p2 형태로 맞추기 (PP1 → p1)
+        if "id" in df.columns:
+            df["id"] = (
+                df["id"]
+                .astype(str)
+                .str.lower()
+                .str.replace("pp", "p", regex=False)
+                .str.strip()
+            )
+
+        # elapsedtime → 숫자형으로 변환
+        if "elapsed" in df.columns:
+            df["elapsed"] = (
+                df["elapsed"]
+                .astype(str)
+                .str.strip()
+                .str.replace(" ", "", regex=False)
+            )
+            df["elapsed"] = pd.to_numeric(df["elapsed"], errors="coerce")
+
+        all_rows.append(df)
+
+    labels = pd.concat(all_rows, ignore_index=True)
+
+    # 유효한 id / elapsed / condition 만 필터링
+    labels = labels[
+        labels["id"].notna()
+        & labels["elapsed"].notna()
+        & labels["condition"].notna()
+    ]
+
+    print(f"📌 Loaded {len(labels)} total label rows from {len(xls.sheet_names)} sheets.")
+    return labels
+
+
+# --------------------------------------------------------
+# 3) HRV 피처 계산 함수
+#    - Time Domain: MeanNN, SDNN, RMSSD, pNN50
+#    - Freq Domain: LF, HF, LF/HF (Welch PSD)
+# --------------------------------------------------------
+def compute_hrv_features(rr_intervals: np.ndarray) -> dict:
+    rr = np.array(rr_intervals, dtype=float)
+    diff = np.diff(rr)
+    feats = {}
+
+    # --- Time domain ---
+    feats["MeanNN"] = float(np.mean(rr))
+    feats["SDNN"] = float(np.std(rr))
+    feats["RMSSD"] = float(np.sqrt(np.mean(diff**2))) if len(diff) > 0 else np.nan
+    feats["pNN50"] = float(np.sum(np.abs(diff) > 50) / len(diff) * 100) if len(diff) > 0 else np.nan
+
+    # --- Frequency domain ---
     try:
-        f, psd = signal.welch(rr_intervals, fs=4.0)
-        lf_band = np.trapz(psd[(f >= 0.04) & (f < 0.15)])
-        hf_band = np.trapz(psd[(f >= 0.15) & (f < 0.4)])
-        features["LF_HF"] = lf_band / (hf_band + 1e-6)
+        f, psd = signal.welch(rr - np.mean(rr), fs=4.0, nperseg=min(256, len(rr)))
+        lf_power = np.trapezoid(psd[(f >= 0.04) & (f < 0.15)], f[(f >= 0.04) & (f < 0.15)])
+        hf_power = np.trapezoid(psd[(f >= 0.15) & (f < 0.4)], f[(f >= 0.15) & (f < 0.4)])
+        feats["LF"] = float(lf_power)
+        feats["HF"] = float(hf_power)
+        feats["LF_HF"] = float(lf_power / (hf_power + 1e-6))
     except Exception:
-        features["LF_HF"] = np.nan
-    return features
+        feats["LF"], feats["HF"], feats["LF_HF"] = np.nan, np.nan, np.nan
 
-# -------------------------------
-# 3. 라벨 병합
-# -------------------------------
-def merge_with_labels(hrv_dict, label_path):
-    """Excel 라벨과 HRV 특징 병합"""
-    label_path = Path(label_path)
-    if not label_path.exists():
-        raise FileNotFoundError(f"Label file not found: {label_path}")
+    return feats
 
-    # subject 컬럼을 ID로 통일
-    df_labels = pd.read_excel(label_path)
-    df_labels.rename(columns={"subject": "id"}, inplace=True)
-    df_labels["id"] = df_labels["id"].astype(str)
 
-    rows = []
-    for pid, rri in tqdm(hrv_dict.items(), desc="Processing subjects"):
-        feats = compute_hrv_features(rri)
-        feats["id"] = pid
-        rows.append(feats)
+# --------------------------------------------------------
+# 4) elapsedtime 기반으로 HRV 세그먼트 추출
+#    - 참가자(id)별로 label/condition 그룹핑
+#    - 각 그룹의 elapsed min~max를 하나의 구간으로 보고
+#      RRI의 time_s 와 매칭해서 HRV 피처 계산
+# --------------------------------------------------------
+def extract_hrv_with_labels(rri_dict: dict, labels: pd.DataFrame) -> pd.DataFrame:
+    all_rows = []
 
-    df_hrv = pd.DataFrame(rows)
-    df_merged = pd.merge(df_hrv, df_labels, on="id", how="inner")
-    return df_merged
+    print("\n=== Label Sample ===")
+    print(labels.head())
 
-# -------------------------------
-# 4. 메인 실행부
-# -------------------------------
+    for pid, df_rri in tqdm(rri_dict.items(), desc="Processing participants"):
+        # 해당 참가자 라벨만
+        sub = labels[labels["id"] == pid]
+        if sub.empty:
+            continue
+
+        # label + condition 기준으로 구간 묶기
+        # (예: rest-R, neutral-N, time pressure-T, interrupt-I 등)
+        grouped = sub.groupby(["label", "condition"])
+
+        for (lbl, cond), g in grouped:
+            start_t = g["elapsed"].min()
+            end_t = g["elapsed"].max()
+
+            # elapsedtime(초) 기준으로 RRI time_s 매칭
+            seg = df_rri[(df_rri["time_s"] >= start_t) & (df_rri["time_s"] <= end_t)]
+            if len(seg) < 10:  # 너무 짧은 구간은 스킵
+                continue
+
+            feats = compute_hrv_features(seg["rri_ms"].values)
+            feats["Participant"] = pid
+            feats["Label"] = lbl
+            feats["Condition"] = cond
+            feats["Start_elapsed"] = start_t
+            feats["End_elapsed"] = end_t
+
+            all_rows.append(feats)
+
+    df_out = pd.DataFrame(all_rows)
+    print(f"\n✅ Total extracted segments: {len(df_out)}")
+    return df_out
+
+
+# --------------------------------------------------------
+# 5) 메인 실행부
+# --------------------------------------------------------
 def main():
     print("=== HRV Feature Extraction Start ===")
-    print(f"Resolved RAW_DIR: {RAW_DIR}")
-    print(f"Resolved LABEL_PATH: {LABEL_PATH}")
-    print(f"Resolved OUT_PATH: {OUT_PATH}")
+    print(f"RRI_DIR     : {RRI_DIR}")
+    print(f"LABEL_FILE  : {LABEL_FILE}")
+    print(f"OUTPUT_PATH : {OUT_PATH}")
 
-    # 경로 확인
-    if not RAW_DIR.exists():
-        print(f"❌ RAW_DIR does not exist: {RAW_DIR}")
+    # 입력 파일 체크
+    if not RRI_DIR.exists() or not LABEL_FILE.exists():
+        print("❌ Required input files not found.")
+        print(f"  - RRI_DIR   exists? {RRI_DIR.exists()}")
+        print(f"  - LABEL_FILE exists? {LABEL_FILE.exists()}")
         raise SystemExit(1)
-    if not LABEL_PATH.exists():
-        print(f"❌ LABEL_PATH does not exist: {LABEL_PATH}")
-        raise SystemExit(1)
 
-    # 처리 시작
-    hrv_dict = load_rri_files(RAW_DIR)
-    df_final = merge_with_labels(hrv_dict, LABEL_PATH)
+    # 1) RRI & Label 로드
+    rri_dict = load_rri_files(RRI_DIR)
+    labels = load_all_labels(LABEL_FILE)
 
+    # 2) HRV 세그먼트 추출
+    df_features = extract_hrv_with_labels(rri_dict, labels)
+
+    # 3) CSV 저장
     OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    df_final.to_csv(OUT_PATH, index=False, encoding="utf-8-sig")
+    df_features.to_csv(OUT_PATH, index=False, encoding="utf-8-sig")
 
-    print(f"\n✅ Saved processed HRV dataset → {OUT_PATH}")
+    print(f"\n✅ HRV feature file saved → {OUT_PATH}")
     print("=== Sample preview ===")
-    print(df_final.head())
+    print(df_features.head(10))
 
-# -------------------------------
-# 5. 실행
-# -------------------------------
+
 if __name__ == "__main__":
     main()
